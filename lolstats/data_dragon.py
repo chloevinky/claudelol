@@ -105,14 +105,19 @@ class PatchWatcher:
         self.last_version: str | None = None
 
     async def _loop(self) -> None:
+        failures = 0
         while True:
             try:
                 summary = await ensure_current_patch(self.db_path, self.locale)
                 self.last_version = summary.get("version")
                 self.last_check = time.time()
+                failures = 0
+                sleep_for = self.interval
             except Exception:
-                log.exception("Patch watcher: failed to refresh")
-            await asyncio.sleep(self.interval)
+                failures += 1
+                log.exception("Patch watcher: failed to refresh (attempt %d)", failures)
+                sleep_for = min(60.0 * (2 ** (failures - 1)), self.interval)
+            await asyncio.sleep(sleep_for)
 
     def start(self) -> None:
         if self._task is None or self._task.done():

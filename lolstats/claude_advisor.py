@@ -106,14 +106,14 @@ class ClaudeAdvisor:
         self._inflight: dict[str, asyncio.Future] = {}
         self._lock = asyncio.Lock()
         self._last_request_at: float = 0.0
+        self._client_cache: tuple[str, anthropic.AsyncAnthropic] | None = None
 
-    @property
-    def _client(self) -> anthropic.AsyncAnthropic | None:
-        cfg = self._get_config()
-        key = cfg.get("anthropic_api_key") or ""
-        if not key:
-            return None
-        return anthropic.AsyncAnthropic(api_key=key)
+    def _client_for(self, key: str) -> anthropic.AsyncAnthropic:
+        if self._client_cache is not None and self._client_cache[0] == key:
+            return self._client_cache[1]
+        client = anthropic.AsyncAnthropic(api_key=key)
+        self._client_cache = (key, client)
+        return client
 
     def cached(self, fingerprint: str) -> AdvisorResponse | None:
         return self._cache.get(fingerprint)
@@ -168,9 +168,10 @@ class ClaudeAdvisor:
         patch_version: str | None,
     ) -> AdvisorResponse:
         cfg = self._get_config()
-        client = self._client
-        if client is None:
+        key = cfg.get("anthropic_api_key") or ""
+        if not key:
             raise RuntimeError("No Anthropic API key configured")
+        client = self._client_for(key)
 
         cooldown = float(cfg.get("advisor_cooldown_seconds", 30))
         now = time.time()
@@ -211,24 +212,31 @@ class ClaudeAdvisor:
         log.info("Claude advisor: requesting advice (model=%s, fp=%s)", model, fingerprint)
         response = await client.messages.create(**kwargs)
 
+        # With web_search, the model may emit text blocks before tool calls AND
+        # after. The JSON-formatted answer is in the final text block, so walk
+        # the content in reverse and parse the first one that's valid JSON.
         text = ""
-        for block in response.content:
-            if getattr(block, "type", None) == "text":
-                text = block.text
-                break
-
         advice: dict[str, Any] = {}
-        if text:
+        text_blocks = [
+            b.text for b in response.content
+            if getattr(b, "type", None) == "text" and getattr(b, "text", "")
+        ]
+        for candidate in reversed(text_blocks):
+            text = candidate
             try:
-                advice = json.loads(text)
+                advice = json.loads(candidate)
+                break
             except json.JSONDecodeError:
-                start = text.find("{")
-                end = text.rfind("}")
+                start = candidate.find("{")
+                end = candidate.rfind("}")
                 if start != -1 and end > start:
                     try:
-                        advice = json.loads(text[start : end + 1])
+                        advice = json.loads(candidate[start : end + 1])
+                        break
                     except json.JSONDecodeError:
-                        log.warning("Claude advisor: response was not valid JSON")
+                        continue
+        if not advice and text_blocks:
+            log.warning("Claude advisor: no valid JSON in %d text block(s)", len(text_blocks))
 
         return AdvisorResponse(
             advice=advice,

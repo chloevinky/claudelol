@@ -131,7 +131,10 @@
     adviceMeta.textContent = `${state.advice.model || ""} · patch ${state.advice.patch_version || "?"} · ${tsStr}`;
   }
 
+  let lastSnapshot = null;
+
   function applyState(state) {
+    if (state.snapshot) lastSnapshot = state.snapshot;
     if (state.in_game && state.snapshot) {
       notInGame.classList.add("hidden");
       gameGrid.classList.remove("hidden");
@@ -185,13 +188,6 @@
       }
     };
   }
-
-  let lastSnapshot = null;
-  const origApply = applyState;
-  applyState = (state) => {
-    if (state.snapshot) lastSnapshot = state.snapshot;
-    origApply(state);
-  };
 
   // -- tabs --
 

@@ -98,9 +98,10 @@ async def lifespan(app: FastAPI):
         ):
             fp = state["fingerprint"]
             if advisor.cached(fp) is None:
-                asyncio.create_task(
+                task = asyncio.create_task(
                     _request_and_broadcast(advisor, hub, state["snapshot"], fp, patch_watcher.last_version)
                 )
+                task.add_done_callback(_log_task_exception)
 
     monitor = GameMonitor(get_config=config.load, on_state_change=on_state_change)
 
@@ -117,6 +118,14 @@ async def lifespan(app: FastAPI):
     finally:
         await monitor.stop()
         await patch_watcher.stop()
+
+
+def _log_task_exception(task: asyncio.Task) -> None:
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        log.exception("Background task failed", exc_info=exc)
 
 
 async def _request_and_broadcast(
