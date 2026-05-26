@@ -47,8 +47,8 @@
             <button id="refresh-advice" class="btn">↻ Refresh</button>
           </div>
           <div id="advice-summary" class="big">—</div>
-          <div id="advice-spike" class="muted">—</div>
-          <div id="advice-matchup" class="muted small"></div>
+          <div id="advice-opponent" class="muted">—</div>
+          <div id="advice-spike" class="muted small"></div>
           <div id="advice-meta" class="muted small"></div>
         </div>
 
@@ -126,6 +126,20 @@
         <h2>Patch database</h2>
         <p id="patch-info" class="muted">Loading…</p>
         <button id="refresh-patch" class="btn">Re-download current patch</button>
+      </div>
+
+      <div class="card">
+        <h2>Logs</h2>
+        <p class="muted small">
+          If Claude gives bad advice, download <code>claude.jsonl</code> — it
+          contains the full request, web-search results, and Claude's response.
+        </p>
+        <p class="muted small" id="logs-dir">—</p>
+        <div id="logs-files"></div>
+        <details>
+          <summary class="muted small">Recent server log (last 200 lines)</summary>
+          <pre id="logs-tail" class="logtail"></pre>
+        </details>
       </div>
     </section>
   </main>

@@ -58,7 +58,7 @@ class GameMonitor:
 
                 if raw is None:
                     if self.state["in_game"]:
-                        log.info("GameMonitor: game ended")
+                        log.info("Game ended")
                         self.state["in_game"] = False
                         self.state["snapshot"] = None
                         self.state["fingerprint"] = None
@@ -67,10 +67,27 @@ class GameMonitor:
                     snap = live_client.reduce_snapshot(raw)
                     fp = live_client.state_fingerprint(snap)
                     if not self.state["in_game"]:
-                        log.info("GameMonitor: game detected")
+                        me = (snap.get("me") or {})
+                        log.info(
+                            "Game detected: champ=%s pos=%s mode=%s map=%s enemies=%s",
+                            me.get("champion"), me.get("position"),
+                            (snap.get("game") or {}).get("mode"),
+                            (snap.get("game") or {}).get("map_name"),
+                            [e.get("champion") for e in snap.get("enemies", [])],
+                        )
                         self.state["in_game"] = True
                         self.state["last_game_start"] = now
                     if fp != self.state["fingerprint"]:
+                        me = (snap.get("me") or {})
+                        log.info(
+                            "State change: fp=%s gt=%ss champ=%s items=%d gold=%s lvl=%s",
+                            fp,
+                            (snap.get("game") or {}).get("game_time"),
+                            me.get("champion"),
+                            len(me.get("items", []) or []),
+                            me.get("current_gold"),
+                            me.get("level"),
+                        )
                         self.state["snapshot"] = snap
                         self.state["fingerprint"] = fp
                         await self._emit()

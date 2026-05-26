@@ -10,10 +10,11 @@ skip opening the browser.
 from __future__ import annotations
 
 import argparse
-import logging
 import webbrowser
 
 import uvicorn
+
+from lolstats.logging_setup import setup as setup_logging, GENERAL_LOG, CLAUDE_TRACE
 
 
 def main() -> None:
@@ -25,10 +26,10 @@ def main() -> None:
     parser.add_argument("--log-level", default="info")
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=args.log_level.upper(),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    logs_dir = setup_logging(args.log_level)
+    print(f"Logs: {logs_dir}")
+    print(f"  general:      {GENERAL_LOG}")
+    print(f"  claude trace: {CLAUDE_TRACE}  (send this when reporting bad advice)")
 
     if not args.no_open and not args.reload:
         try:

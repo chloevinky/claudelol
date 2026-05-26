@@ -14,7 +14,7 @@
   const gameClock = $("#game-clock");
   const adviceSummary = $("#advice-summary");
   const adviceSpike = $("#advice-spike");
-  const adviceMatchup = $("#advice-matchup");
+  const adviceOpponent = $("#advice-opponent");
   const adviceMeta = $("#advice-meta");
   const bestItems = $("#best-items");
   const counterItems = $("#counter-items");
@@ -90,7 +90,7 @@
     if (!advice || Object.keys(advice).length === 0) {
       adviceSummary.textContent = state?.advice?.error ? `Error: ${state.advice.error}` : "Waiting for Claude…";
       adviceSpike.textContent = "";
-      adviceMatchup.textContent = "";
+      adviceOpponent.textContent = "";
       bestItems.innerHTML = `<li class="muted small">—</li>`;
       counterItems.innerHTML = `<li class="muted small">—</li>`;
       tipsList.innerHTML = `<li class="muted small">—</li>`;
@@ -98,8 +98,8 @@
       return;
     }
     adviceSummary.textContent = advice.summary || "—";
+    adviceOpponent.textContent = advice.lane_opponent ? `Lane: ${advice.lane_opponent}` : "";
     adviceSpike.textContent = advice.power_spike ? `Spike: ${advice.power_spike}` : "";
-    adviceMatchup.textContent = advice.lane_matchup ? `Lane: ${advice.lane_matchup}` : "";
 
     bestItems.innerHTML = "";
     (advice.best_items || []).forEach((it) => {
@@ -224,6 +224,48 @@
       patchInfoEl.textContent = `Cached patch ${patch.version} (${counts.champions ?? 0} champs, ${counts.items ?? 0} items, ${counts.runes ?? 0} runes, ${counts.summoner_spells ?? 0} spells), locale ${patch.locale || "?"}.`;
     } else {
       patchInfoEl.textContent = "Patch data not loaded yet. Click below to download it now.";
+    }
+
+    loadLogs();
+  }
+
+  function fmtBytes(n) {
+    if (n < 1024) return `${n} B`;
+    if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+    return `${(n / 1024 / 1024).toFixed(1)} MB`;
+  }
+
+  async function loadLogs() {
+    try {
+      const r = await fetch("/api/logs");
+      const data = await r.json();
+      const dirEl = document.getElementById("logs-dir");
+      const filesEl = document.getElementById("logs-files");
+      if (dirEl) dirEl.innerHTML = `Logs folder: <code>${data.logs_dir}</code>`;
+      if (filesEl) {
+        filesEl.innerHTML = "";
+        const list = document.createElement("div");
+        list.className = "log-files";
+        (data.files || []).forEach((f) => {
+          const a = document.createElement("a");
+          a.href = `/api/logs/file/${encodeURIComponent(f.name)}`;
+          a.download = f.name;
+          a.innerHTML = `${f.name}<span class="size">${fmtBytes(f.size_bytes)}</span>`;
+          list.appendChild(a);
+        });
+        if (!list.children.length) {
+          list.innerHTML = `<span class="muted small">No log files yet — they'll appear after the server runs for a bit.</span>`;
+        }
+        filesEl.appendChild(list);
+      }
+      const tailEl = document.getElementById("logs-tail");
+      if (tailEl) {
+        const tr = await fetch("/api/logs/tail?lines=200");
+        const td = await tr.json();
+        tailEl.textContent = (td.lines || []).join("\n");
+      }
+    } catch (e) {
+      // ignore
     }
   }
 

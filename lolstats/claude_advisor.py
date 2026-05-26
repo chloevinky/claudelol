@@ -1,9 +1,14 @@
-"""Ask Claude for live build advice using web search.
+"""Ask Claude for itemization advice using web search.
 
-We send a compact game-state JSON, plus the current patch version, to Claude
-with the `web_search_20260209` tool. The model is instructed to return advice
-as a JSON object via `output_config.format`. Results are cached by a state
-fingerprint to avoid hammering the API on tiny state changes.
+The model is told to recommend items based on STAT-LEVEL traits of the enemy
+team (healing, heavy AD, heavy AP, burst, hard CC, mobility, attack speed,
+shielding). It is NOT to describe how individual abilities work — that
+constraint is enforced in the system prompt because the model can hallucinate
+specifics about ability mechanics.
+
+A full trace of every request (request payload + response content blocks
+including web-search results + parsed advice) is appended as one JSON line
+per call to `~/.lolstats/logs/claude.jsonl` so a user can share it for review.
 """
 from __future__ import annotations
 
@@ -16,6 +21,8 @@ from typing import Any
 
 import anthropic
 
+from .logging_setup import CLAUDE_TRACE
+
 log = logging.getLogger(__name__)
 
 
@@ -24,20 +31,34 @@ ADVICE_SCHEMA: dict[str, Any] = {
     "properties": {
         "summary": {
             "type": "string",
-            "description": "One-line tactical summary (under 80 chars).",
+            "description": "One-line itemization plan (under 80 chars).",
+        },
+        "lane_opponent": {
+            "type": "string",
+            "description": (
+                "Lane opponent name + 1-2 stat-level traits to itemize against, "
+                "e.g. 'Darius - heavy AD, strong sustain'. Do NOT describe "
+                "specific ability mechanics."
+            ),
         },
         "power_spike": {
             "type": "string",
-            "description": "Where your champ is in its curve right now (e.g. 'weak laning, scales after 2 items').",
+            "description": (
+                "When your champ spikes, in terms of item / level milestones. "
+                "Do not describe specific ability mechanics."
+            ),
         },
         "best_items": {
             "type": "array",
-            "description": "3-6 items to build right now, in priority order.",
+            "description": "3-6 items for the user's core build, in priority order.",
             "items": {
                 "type": "object",
                 "properties": {
                     "name": {"type": "string"},
-                    "reason": {"type": "string", "description": "Under 15 words."},
+                    "reason": {
+                        "type": "string",
+                        "description": "Under 15 words. Stick to stats/role, not ability descriptions.",
+                    },
                 },
                 "required": ["name", "reason"],
                 "additionalProperties": False,
@@ -45,13 +66,27 @@ ADVICE_SCHEMA: dict[str, Any] = {
         },
         "counter_items": {
             "type": "array",
-            "description": "Items to buy against specific enemies. 2-5 entries.",
+            "description": (
+                "2-5 items chosen to counter STAT-LEVEL traits of the enemy team "
+                "(prefer the user's lane opponent first)."
+            ),
             "items": {
                 "type": "object",
                 "properties": {
                     "name": {"type": "string"},
-                    "against": {"type": "string", "description": "Enemy champion or threat."},
-                    "reason": {"type": "string", "description": "Under 15 words."},
+                    "against": {
+                        "type": "string",
+                        "description": (
+                            "The STAT-LEVEL trait this item counters, e.g. "
+                            "'healing', 'heavy AD', 'heavy AP', 'burst', "
+                            "'hard CC', 'mobility', 'attack speed', 'shielding'. "
+                            "NOT a specific ability name."
+                        ),
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Under 15 words. Reference the stat/trait, not the ability.",
+                    },
                 },
                 "required": ["name", "against", "reason"],
                 "additionalProperties": False,
@@ -59,30 +94,52 @@ ADVICE_SCHEMA: dict[str, Any] = {
         },
         "tips": {
             "type": "array",
-            "description": "2-4 short tactical tips. Under 18 words each.",
+            "description": (
+                "2-4 short tips. ONLY itemization timing or game-flow advice "
+                "(when to rush an item, when to back, who scales). NEVER claims "
+                "about how an enemy ability works."
+            ),
             "items": {"type": "string"},
         },
-        "lane_matchup": {
-            "type": "string",
-            "description": "Lane matchup difficulty: 'favored', 'even', or 'losing', plus a short reason.",
-        },
     },
-    "required": ["summary", "best_items", "counter_items", "tips"],
+    "required": ["summary", "lane_opponent", "best_items", "counter_items", "tips"],
     "additionalProperties": False,
 }
 
 
-SYSTEM_PROMPT = """You are a League of Legends in-game coach. The user is currently \
-in a live match and needs concise, actionable advice. Use the web_search tool to find \
-up-to-date build / counter / matchup information for the current patch when needed \
-(e.g. u.gg, op.gg, mobalytics, lolalytics, official patch notes).
+SYSTEM_PROMPT = """You are a League of Legends in-game ITEMIZATION coach. The user is \
+in a live match and needs concise itemization advice for the current patch.
 
-Rules:
-- Keep every "reason" / "tip" under ~15 words. Pretend the user has 5 seconds to read.
-- Prefer concrete item names from the current patch over generic stat advice.
-- Pick counter-items that target specific threats on the enemy team (heavy AD/AP/healing/CC/burst).
-- If their build is already optimal, say so in `summary` and recommend the next slot.
-- Never invent items. If unsure, search the web."""
+YOUR JOB: Recommend items based on stat-level traits of the enemy team — \
+healing, heavy AD, heavy AP, burst, hard CC, mobility, attack speed, shielding. \
+Focus on the user's LANE OPPONENT first.
+
+USE web_search when:
+- Looking up the current-patch core build for the user's champion + role
+- Looking up matchup-specific item priorities (e.g. "Aatrox vs Darius items")
+
+HARD RULES — do NOT break these:
+- NEVER describe how a specific enemy ability works. You have not been told \
+the current patch's ability text and you must not invent it. If you don't \
+know, do not write it down.
+- NEVER give "bait this ability" or "dodge that ability" style tactical tips.
+- NEVER reference an enemy ability by name in `tips`, `reason`, or `against`. \
+Refer to traits ("healing", "heavy AD", etc.) instead.
+- NEVER invent items. If you're unsure an item exists in this patch, search.
+
+GOOD counter-item examples:
+- {"name": "Bramble Vest", "against": "healing", "reason": "anti-heal vs sustain bruisers"}
+- {"name": "Plated Steelcaps", "against": "heavy AD / autos", "reason": "AD lane, basic-attack mitigation"}
+- {"name": "Mercury's Treads", "against": "hard CC", "reason": "tenacity vs CC-heavy enemy team"}
+
+BAD counter-item examples (do NOT do this):
+- "Bait his Q before all-in" — describes ability mechanics
+- "Dodge the spinning axe" — references an ability
+- {"against": "Darius Q"} — names an ability instead of a trait
+
+FORMAT:
+- Keep every `reason` / `tip` under ~15 words.
+- best_items must be the standard current-patch core build for the user's champion."""
 
 
 @dataclass
@@ -95,6 +152,34 @@ class AdvisorResponse:
     error: str | None = None
     model: str | None = None
     raw_text: str | None = None
+
+
+def _dump_block(block: Any) -> dict[str, Any]:
+    """Best-effort serialize an SDK response content block to a JSON-safe dict."""
+    try:
+        return block.model_dump(mode="json")
+    except Exception:
+        pass
+    out: dict[str, Any] = {"type": getattr(block, "type", "unknown")}
+    for attr in ("text", "id", "name", "input", "content", "title", "url"):
+        v = getattr(block, attr, None)
+        if v is None:
+            continue
+        try:
+            json.dumps(v)
+            out[attr] = v
+        except (TypeError, ValueError):
+            out[attr] = repr(v)
+    return out
+
+
+def _write_trace(record: dict[str, Any]) -> None:
+    try:
+        CLAUDE_TRACE.parent.mkdir(parents=True, exist_ok=True)
+        with CLAUDE_TRACE.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+    except Exception:
+        log.exception("Failed to write Claude trace")
 
 
 class ClaudeAdvisor:
@@ -156,6 +241,14 @@ class ClaudeAdvisor:
                 patch_version=patch_version,
                 error=str(exc),
             )
+            _write_trace(
+                {
+                    "ts": time.time(),
+                    "fingerprint": fingerprint,
+                    "patch": patch_version,
+                    "error": str(exc),
+                }
+            )
             future.set_result(err_resp)
             return err_resp
         finally:
@@ -191,9 +284,10 @@ class ClaudeAdvisor:
             "enemies": snapshot.get("enemies", []),
         }
         user_message = (
-            "Live game state below. Please use web search to look up build / "
-            "counter / matchup info for the *current patch* if you're not sure, "
-            "then return advice as JSON matching the schema.\n\n```json\n"
+            "Live game state below. Recommend items the user should build "
+            "(core and counters against the enemy team's stat traits). "
+            "Use web search to confirm current-patch core build and matchup item "
+            "priorities. Return JSON matching the schema.\n\n```json\n"
             + json.dumps(user_payload, indent=2)
             + "\n```"
         )
@@ -209,7 +303,13 @@ class ClaudeAdvisor:
             output_config={"format": {"type": "json_schema", "schema": ADVICE_SCHEMA}},
         )
 
-        log.info("Claude advisor: requesting advice (model=%s, fp=%s)", model, fingerprint)
+        request_started_at = time.time()
+        log.info(
+            "Claude request: model=%s fp=%s patch=%s champ=%s enemies=%s",
+            model, fingerprint, patch_version,
+            (snapshot.get("me") or {}).get("champion"),
+            [e.get("champion") for e in snapshot.get("enemies", [])],
+        )
         response = await client.messages.create(**kwargs)
 
         # With web_search, the model may emit text blocks before tool calls AND
@@ -237,6 +337,49 @@ class ClaudeAdvisor:
                         continue
         if not advice and text_blocks:
             log.warning("Claude advisor: no valid JSON in %d text block(s)", len(text_blocks))
+
+        usage = {}
+        try:
+            usage = response.usage.model_dump(mode="json")
+        except Exception:
+            pass
+
+        elapsed = time.time() - request_started_at
+        log.info(
+            "Claude response: fp=%s stop=%s elapsed=%.1fs usage_in=%s usage_out=%s items=%d counters=%d tips=%d",
+            fingerprint,
+            getattr(response, "stop_reason", None),
+            elapsed,
+            usage.get("input_tokens"),
+            usage.get("output_tokens"),
+            len(advice.get("best_items", []) or []),
+            len(advice.get("counter_items", []) or []),
+            len(advice.get("tips", []) or []),
+        )
+
+        _write_trace(
+            {
+                "ts": time.time(),
+                "elapsed_seconds": elapsed,
+                "fingerprint": fingerprint,
+                "patch": patch_version,
+                "model": model,
+                "request": {
+                    "system": SYSTEM_PROMPT,
+                    "user_message": user_message,
+                    "tools": kwargs["tools"],
+                    "max_tokens": kwargs["max_tokens"],
+                    "output_schema": ADVICE_SCHEMA,
+                },
+                "response": {
+                    "stop_reason": getattr(response, "stop_reason", None),
+                    "usage": usage,
+                    "content": [_dump_block(b) for b in response.content],
+                },
+                "parsed_advice": advice,
+                "raw_final_text": text,
+            }
+        )
 
         return AdvisorResponse(
             advice=advice,

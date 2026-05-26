@@ -11,7 +11,7 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import config, data_dragon, db
+from . import config, data_dragon, db, logging_setup
 from .claude_advisor import ClaudeAdvisor
 from .game_monitor import GameMonitor
 
@@ -73,8 +73,11 @@ def _state_payload(monitor: GameMonitor, advisor: ClaudeAdvisor) -> dict[str, An
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    if not logging.getLogger().handlers:
+        logging_setup.setup()
     cfg = config.load()
     db.init(config.DB_PATH)
+    log.info("LoL Live Coach starting. Logs dir: %s", logging_setup.LOGS_DIR)
 
     patch_watcher = data_dragon.PatchWatcher(
         db_path=config.DB_PATH,
@@ -215,6 +218,54 @@ def create_app() -> FastAPI:
             "error": response.error,
             "model": response.model,
         }
+
+    @app.get("/api/logs")
+    async def list_logs() -> dict[str, Any]:
+        logs_dir = logging_setup.LOGS_DIR
+        files = []
+        if logs_dir.exists():
+            for f in sorted(logs_dir.iterdir()):
+                if f.is_file():
+                    stat = f.stat()
+                    files.append(
+                        {
+                            "name": f.name,
+                            "size_bytes": stat.st_size,
+                            "modified_at": stat.st_mtime,
+                        }
+                    )
+        return {"logs_dir": str(logs_dir), "files": files}
+
+    @app.get("/api/logs/file/{name}")
+    async def download_log(name: str) -> FileResponse:
+        # Hard-block any path component — only files directly inside LOGS_DIR.
+        if "/" in name or "\\" in name or ".." in name or name.startswith("."):
+            raise HTTPException(status_code=400, detail="Invalid log filename.")
+        path = logging_setup.LOGS_DIR / name
+        if not path.exists() or not path.is_file():
+            raise HTTPException(status_code=404, detail=f"No such log: {name}")
+        # Resolve and verify the path is still inside LOGS_DIR (symlink safety).
+        if logging_setup.LOGS_DIR.resolve() not in path.resolve().parents:
+            raise HTTPException(status_code=400, detail="Invalid log path.")
+        return FileResponse(path, media_type="text/plain", filename=name)
+
+    @app.get("/api/logs/tail")
+    async def tail_general(lines: int = 200) -> dict[str, Any]:
+        path = logging_setup.GENERAL_LOG
+        if not path.exists():
+            return {"lines": []}
+        lines = max(1, min(int(lines), 5000))
+        with path.open("rb") as f:
+            try:
+                f.seek(0, 2)
+                size = f.tell()
+                # Read the last ~256KB which is more than enough for 5000 lines
+                read_size = min(size, 256 * 1024)
+                f.seek(size - read_size)
+                tail = f.read().decode("utf-8", errors="replace")
+            except OSError:
+                tail = ""
+        return {"lines": tail.splitlines()[-lines:]}
 
     @app.get("/api/champion/{name}")
     async def champion_lookup(name: str) -> dict[str, Any]:
