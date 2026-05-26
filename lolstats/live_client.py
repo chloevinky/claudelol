@@ -132,33 +132,31 @@ def reduce_snapshot(raw: dict[str, Any]) -> dict[str, Any]:
 
 
 def state_fingerprint(snap: dict[str, Any]) -> str:
-    """Stable token that changes only when the game-state changes 'meaningfully'.
+    """Stable token for the *matchup*, not the live game state.
 
-    We hash:
-      - The set of champion names on each side (catches game start / lobby).
-      - The set of item IDs each player owns (catches purchases).
-      - Whether the game is in early/mid/late phase (5-minute buckets).
+    Once both teams are locked in at game load, the matchup never changes —
+    so this fingerprint stays constant for the whole match. That means the
+    advisor fires once at game start and the backend stops broadcasting
+    state updates until a new game (different champ comp) starts.
+
+    We hash only:
+      - The user's champion and lane position.
+      - The set of {champion, position} pairs on each side.
     """
     import hashlib
 
     me = snap.get("me") or {}
     allies = snap.get("allies") or []
     enemies = snap.get("enemies") or []
-    game = snap.get("game") or {}
 
-    pieces: list[str] = []
-    pieces.append(f"me={me.get('champion','')}|pos={me.get('position','')}")
-    pieces.append("items=" + ",".join(str(i["id"]) for i in me.get("items", [])))
-    pieces.append("allies=" + ",".join(sorted(p["champion"] for p in allies)))
-    pieces.append("enemies=" + ",".join(sorted(p["champion"] for p in enemies)))
-    pieces.append("ally_items=" + "/".join(
-        ",".join(str(i["id"]) for i in p.get("items", []))
-        for p in sorted(allies, key=lambda x: x["champion"])
-    ))
-    pieces.append("enemy_items=" + "/".join(
-        ",".join(str(i["id"]) for i in p.get("items", []))
-        for p in sorted(enemies, key=lambda x: x["champion"])
-    ))
-    phase = min(int(game.get("game_time", 0) // 300), 6)
-    pieces.append(f"phase={phase}")
+    def comp(players: list[dict[str, Any]]) -> str:
+        return ",".join(
+            sorted(f"{p.get('champion','')}:{p.get('position','')}" for p in players)
+        )
+
+    pieces = [
+        f"me={me.get('champion','')}|pos={me.get('position','')}",
+        "allies=" + comp(allies),
+        "enemies=" + comp(enemies),
+    ]
     return hashlib.sha256("|".join(pieces).encode()).hexdigest()[:16]

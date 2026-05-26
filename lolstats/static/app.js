@@ -9,9 +9,8 @@
   const gameGrid = $("#game-grid");
   const meName = $("#me-name");
   const mePosition = $("#me-position");
-  const meSummary = $("#me-summary");
-  const meItems = $("#me-items");
-  const gameClock = $("#game-clock");
+  const meSpells = $("#me-spells");
+  const meKeystone = $("#me-keystone");
   const adviceSummary = $("#advice-summary");
   const adviceSpike = $("#advice-spike");
   const adviceOpponent = $("#advice-opponent");
@@ -26,21 +25,14 @@
   const configForm = $("#config-form");
   const configSaved = $("#config-saved");
 
-  function formatClock(seconds) {
-    if (!seconds) return "0:00";
-    const m = Math.floor(seconds / 60);
-    const s = Math.floor(seconds % 60);
-    return `${m}:${s.toString().padStart(2, "0")}`;
-  }
-
   function renderPlayer(p) {
     const div = document.createElement("div");
     div.className = "player";
-    const scores = p.scores || {};
+    const spells = (p.summoner_spells || []).filter(Boolean).join(" / ") || "—";
     div.innerHTML = `
       <span class="champ">${p.champion || "?"}</span>
       <span class="pos">${p.position || ""}</span>
-      <span class="score">${scores.kills ?? 0}/${scores.deaths ?? 0}/${scores.assists ?? 0} · CS ${scores.creepScore ?? 0}</span>
+      <span class="score">${spells}${p.keystone ? ` · ${p.keystone}` : ""}</span>
     `;
     return div;
   }
@@ -57,32 +49,15 @@
     const me = snap.me;
     if (!me) {
       meName.textContent = "Spectator / unknown";
-      meItems.innerHTML = "";
-      meSummary.innerHTML = "";
       mePosition.textContent = "";
+      meSpells.textContent = "";
+      meKeystone.textContent = "";
       return;
     }
     meName.textContent = `${me.champion || "?"} — ${me.summoner || ""}`;
     mePosition.textContent = me.position || "";
-    const sc = me.scores || {};
-    meSummary.innerHTML = `
-      <strong>${sc.kills ?? 0} / ${sc.deaths ?? 0} / ${sc.assists ?? 0}</strong>
-      &nbsp;·&nbsp; CS ${sc.creepScore ?? 0}
-      &nbsp;·&nbsp; lvl ${me.level ?? 0}
-      &nbsp;·&nbsp; gold ${me.current_gold ?? 0}
-      &nbsp;·&nbsp; keystone <strong>${me.keystone || "—"}</strong>
-      &nbsp;·&nbsp; spells ${(me.summoner_spells || []).filter(Boolean).join(" / ") || "—"}
-    `;
-    meItems.innerHTML = "";
-    (me.items || []).forEach((it) => {
-      const span = document.createElement("span");
-      span.className = "item";
-      span.textContent = it.name || `#${it.id}`;
-      meItems.appendChild(span);
-    });
-    if (!me.items || me.items.length === 0) {
-      meItems.innerHTML = `<span class="muted small">No items yet</span>`;
-    }
+    meSpells.textContent = (me.summoner_spells || []).filter(Boolean).join(" / ") || "";
+    meKeystone.textContent = me.keystone || "";
   }
 
   function renderAdvice(state) {
@@ -139,7 +114,6 @@
       notInGame.classList.add("hidden");
       gameGrid.classList.remove("hidden");
       const snap = state.snapshot;
-      gameClock.textContent = formatClock(snap.game?.game_time || 0);
       renderMe(snap);
       renderTeam(enemiesEl, snap.enemies);
       renderTeam(alliesEl, snap.allies);

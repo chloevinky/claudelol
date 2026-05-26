@@ -26,7 +26,7 @@
     <section id="tab-game" class="tab-panel active">
       <div id="not-in-game" class="card placeholder">
         <h2>Waiting for a game…</h2>
-        <p>Start a League match. Stats and Claude advice will appear here automatically.</p>
+        <p>Start a League match. Once you load into the game with both teams confirmed, the matchup and Claude's advice will appear here. The page does not update during the match — open it once at the start, then play.</p>
         <p class="hint">If you're already in a game and nothing shows up, make sure the Riot client is running on this machine and that the local API on port 2999 is reachable.</p>
       </div>
 
@@ -35,16 +35,15 @@
           <div class="card-head">
             <h2 id="me-name">You</h2>
             <div class="pill" id="me-position"></div>
-            <div class="pill" id="game-clock">0:00</div>
+            <div class="pill" id="me-spells"></div>
+            <div class="pill" id="me-keystone"></div>
           </div>
-          <div id="me-summary" class="me-summary"></div>
-          <div id="me-items" class="items"></div>
         </div>
 
         <div class="card">
           <div class="card-head">
             <h2>Summary</h2>
-            <button id="refresh-advice" class="btn">↻ Refresh</button>
+            <button id="refresh-advice" class="btn" title="Re-query Claude with the current matchup">↻ Re-query</button>
           </div>
           <div id="advice-summary" class="big">—</div>
           <div id="advice-opponent" class="muted">—</div>
