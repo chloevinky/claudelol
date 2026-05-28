@@ -404,13 +404,26 @@ def pending_facts(
     return [{"id": r["id"], "name": r["name"], "data": json.loads(r["data"])} for r in rows]
 
 
-def facts_counts(db_path: Path, version: str) -> dict[str, int]:
+def facts_counts(
+    db_path: Path, version: str, schema_version: int | None = None
+) -> dict[str, int]:
+    """Distilled-row counts per facts table for ``version``.
+
+    When ``schema_version`` is given, only rows produced at that schema version
+    are counted (so stale rows awaiting re-distillation are excluded).
+    """
     counts: dict[str, int] = {}
     with connect(db_path) as conn:
         for table in FACTS_SOURCES:
-            c = conn.execute(
-                f"SELECT COUNT(*) AS n FROM {table} WHERE version=?", (version,)
-            ).fetchone()
+            if schema_version is None:
+                c = conn.execute(
+                    f"SELECT COUNT(*) AS n FROM {table} WHERE version=?", (version,)
+                ).fetchone()
+            else:
+                c = conn.execute(
+                    f"SELECT COUNT(*) AS n FROM {table} WHERE version=? AND schema_version=?",
+                    (version, schema_version),
+                ).fetchone()
             counts[table] = c["n"]
     return counts
 

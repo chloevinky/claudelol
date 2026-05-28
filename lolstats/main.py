@@ -198,6 +198,32 @@ def create_app() -> FastAPI:
             get_config=config.load,
         )
 
+    @app.get("/api/distill")
+    async def get_distill() -> dict[str, Any]:
+        version = db.patch_summary(config.DB_PATH).get("version")
+        return await asyncio.to_thread(
+            distiller.distill_status, config.DB_PATH, version, config.load
+        )
+
+    @app.post("/api/distill/run")
+    async def run_distill() -> dict[str, Any]:
+        version = db.patch_summary(config.DB_PATH).get("version")
+        if not version:
+            raise HTTPException(status_code=503, detail="Patch data not loaded yet.")
+        cfg = config.load()
+        if not cfg.get("anthropic_api_key"):
+            raise HTTPException(status_code=400, detail="Anthropic API key not configured.")
+        if not cfg.get("distiller_enabled", True):
+            raise HTTPException(status_code=409, detail="Distiller is disabled in settings.")
+        if distiller._distill_lock.locked():
+            return {"started": False, "running": True, "version": version}
+        task = asyncio.create_task(
+            distiller.distill_patch(config.DB_PATH, version, config.load),
+            name=f"distill-manual-{version}",
+        )
+        task.add_done_callback(_log_task_exception)
+        return {"started": True, "running": True, "version": version}
+
     @app.post("/api/advice/refresh")
     async def refresh_advice() -> dict[str, Any]:
         state = app.state.monitor.state

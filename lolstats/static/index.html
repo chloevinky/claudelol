@@ -116,9 +116,47 @@
             <input type="checkbox" name="advisor_enabled" />
             <span>Auto-request Claude advice when game state changes</span>
           </label>
+
+          <fieldset class="subsection">
+            <legend>Data Dragon distillation</legend>
+            <label class="row">
+              <input type="checkbox" name="distiller_enabled" />
+              <span>Distill Data Dragon into advisor facts (runs once per patch)</span>
+            </label>
+            <label class="row">
+              <input type="checkbox" name="advisor_use_datadragon" />
+              <span>Ground advice in distilled facts (exact item stats &amp; counters)</span>
+            </label>
+            <label>
+              <span>Distiller model (cheap model that parses the catalog)</span>
+              <select name="distiller_model">
+                <option value="claude-haiku-4-5">Claude Haiku 4.5 (fastest, cheapest)</option>
+                <option value="claude-sonnet-4-6">Claude Sonnet 4.6 (more accurate)</option>
+              </select>
+            </label>
+            <label>
+              <span>Batch size (records per request)</span>
+              <input type="number" name="distill_batch_size" min="1" max="50" />
+            </label>
+            <label>
+              <span>Max concurrency (parallel requests)</span>
+              <input type="number" name="distill_max_concurrency" min="1" max="16" />
+            </label>
+          </fieldset>
+
           <button type="submit" class="btn primary">Save</button>
           <span id="config-saved" class="muted"></span>
         </form>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <h2>Distillation status</h2>
+          <button id="refresh-distill" class="btn" title="Distill any records still missing facts">▶ Run now</button>
+        </div>
+        <p id="distill-summary" class="muted small">Loading…</p>
+        <div id="distill-overall" class="progress-row"></div>
+        <div id="distill-kinds"></div>
       </div>
 
       <div class="card">

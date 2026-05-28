@@ -59,6 +59,13 @@ _MAX_TOKENS = {"item": 8192, "champion": 8192, "rune": 4096, "spell": 2048}
 
 _distill_lock = asyncio.Lock()
 
+# Kinds whose grammar-constrained schema the API has rejected during the current
+# run (e.g. "Schema is too complex"). Once a kind lands here we stop sending
+# ``output_config`` for it and emit prompt-only JSON, avoiding a doomed (and
+# slow — grammar compilation can take minutes before it times out) first call on
+# every remaining batch. Reset at the start of each :func:`distill_patch` run.
+_SCHEMA_DISABLED: set[str] = set()
+
 
 # --- HTML / data reduction (pure, testable without the SDK) ----------------
 
@@ -205,18 +212,14 @@ _ITEM_FACT = {
     "properties": {
         "id": {"type": "string"},
         "name": {"type": "string"},
+        # Free-form numeric map (keys listed in the system prompt). Enumerating
+        # all ~20 optional keys as fixed properties made the grammar-constrained
+        # schema explode ("Schema is too complex" / "Grammar compilation timed
+        # out"); an open object keeps the same {key: number} shape but a tiny
+        # grammar.
         "stats": {
             "type": "object",
-            "properties": {
-                k: {"type": "number"}
-                for k in (
-                    "ad", "ap", "hp", "armor", "mr", "as_pct", "crit_pct",
-                    "ability_haste", "lethality", "mpen_flat", "mpen_pct",
-                    "ms_flat", "ms_pct", "heal_shield_power", "omnivamp",
-                    "lifesteal", "mana", "mana_regen", "hp5", "mp5", "tenacity_pct",
-                )
-            },
-            "additionalProperties": False,
+            "additionalProperties": {"type": "number"},
         },
         "effects": {
             "type": "array",
@@ -385,9 +388,21 @@ def _slice_json(text: str) -> str | None:
 
 
 async def _call_model(
-    client: Any, model: str, kind: str, records: list[dict[str, Any]], max_tokens: int
+    client: Any,
+    model: str,
+    kind: str,
+    records: list[dict[str, Any]],
+    max_tokens: int,
+    use_schema: bool = True,
 ) -> dict[str, dict[str, Any]]:
-    """One structured call; returns {id: fact_object}. Raises if nothing parses."""
+    """One model call; returns {id: fact_object}. Raises if nothing parses.
+
+    When ``use_schema`` is true the request is grammar-constrained to the batch
+    JSON schema. Some schemas are too large for the grammar compiler (it returns
+    a 400 "Schema is too complex" / "Grammar compilation timed out"); callers
+    fall back to ``use_schema=False``, which asks for the same JSON in prose and
+    relies on :func:`_parse_facts` to extract it.
+    """
     user = (
         f"Distill the following {len(records)} League of Legends {_KIND_LABEL[kind]} "
         "into fact objects. Return one object per input, echoing its exact `id`. "
@@ -395,13 +410,24 @@ async def _call_model(
         + json.dumps(records, ensure_ascii=False)
         + "\n```"
     )
-    response = await client.messages.create(
+    kwargs: dict[str, Any] = dict(
         model=model,
         max_tokens=max_tokens,
         system=_system_blocks(kind),
         messages=[{"role": "user", "content": user}],
-        output_config={"format": {"type": "json_schema", "schema": _BATCH_SCHEMA[kind]}},
     )
+    if use_schema:
+        kwargs["output_config"] = {
+            "format": {"type": "json_schema", "schema": _BATCH_SCHEMA[kind]}
+        }
+    else:
+        user += (
+            '\n\nReturn ONLY a JSON object of the form {"facts": [ ... ]} containing '
+            "one fact object per input item, and nothing else — no prose, no markdown "
+            "code fences."
+        )
+        kwargs["messages"] = [{"role": "user", "content": user}]
+    response = await client.messages.create(**kwargs)
     out: dict[str, dict[str, Any]] = {}
     for fact in _parse_facts(response):
         fid = str(fact.get("id", ""))
@@ -410,6 +436,26 @@ async def _call_model(
     if not out:
         raise ValueError(f"no facts parsed for {kind} batch of {len(records)}")
     return out
+
+
+def _short_err(exc: BaseException) -> str:
+    msg = str(exc).strip().replace("\n", " ")
+    return msg[:200] if msg else exc.__class__.__name__
+
+
+async def _call_safe(
+    client: Any,
+    model: str,
+    kind: str,
+    records: list[dict[str, Any]],
+    max_tokens: int,
+    use_schema: bool,
+) -> tuple[dict[str, dict[str, Any]] | None, BaseException | None]:
+    """Run :func:`_call_model`, returning ``(facts, None)`` or ``(None, exc)``."""
+    try:
+        return await _call_model(client, model, kind, records, max_tokens, use_schema), None
+    except Exception as exc:  # noqa: BLE001 — surfaced to the caller as a value
+        return None, exc
 
 
 async def _process_batch(
@@ -425,18 +471,39 @@ async def _process_batch(
     max_tokens = _MAX_TOKENS[kind]
     records = [p["input"] for p in prepared]
     async with sem:
-        try:
-            facts_by_id = await _call_model(client, model, kind, records, max_tokens)
-        except Exception:
+        use_schema = kind not in _SCHEMA_DISABLED
+        facts_by_id, err = await _call_safe(client, model, kind, records, max_tokens, use_schema)
+        # A grammar-constrained call that errors is almost always the schema
+        # being rejected; drop the schema for this kind and retry as plain JSON.
+        if err is not None and use_schema:
+            _SCHEMA_DISABLED.add(kind)
             log.warning(
-                "Distiller: %s batch of %d failed, retrying per-record", kind, len(records)
+                "Distiller: %s structured-output schema rejected (%s); "
+                "falling back to prompt-only JSON for remaining %s batches",
+                kind, _short_err(err), kind,
+            )
+            use_schema = False
+            facts_by_id, err = await _call_safe(
+                client, model, kind, records, max_tokens, use_schema
+            )
+        if err is not None:
+            log.warning(
+                "Distiller: %s batch of %d failed (%s), retrying per-record",
+                kind, len(records), _short_err(err),
             )
             facts_by_id = {}
             for p in prepared:
-                try:
-                    facts_by_id.update(await _call_model(client, model, kind, [p["input"]], max_tokens))
-                except Exception:
-                    log.exception("Distiller: gave up on %s %s", kind, p["id"])
+                sub, sub_err = await _call_safe(
+                    client, model, kind, [p["input"]], max_tokens, use_schema
+                )
+                if sub_err is None and sub:
+                    facts_by_id.update(sub)
+                else:
+                    log.error(
+                        "Distiller: gave up on %s %s (%s)",
+                        kind, p["id"], _short_err(sub_err) if sub_err else "no facts parsed",
+                    )
+    facts_by_id = facts_by_id or {}
 
     rows: list[dict[str, Any]] = []
     for p in prepared:
@@ -504,6 +571,7 @@ async def distill_patch(db_path: Path, version: str, get_config) -> dict[str, An
     concurrency = max(1, int(cfg.get("distill_max_concurrency", 4)))
 
     async with _distill_lock:
+        _SCHEMA_DISABLED.clear()
         sem = asyncio.Semaphore(concurrency)
         written: dict[str, int] = {}
         async with anthropic.AsyncAnthropic(api_key=key) as client:
@@ -520,6 +588,58 @@ async def distill_patch(db_path: Path, version: str, get_config) -> dict[str, An
             "written": written,
             "facts_counts": db.facts_counts(db_path, version),
         }
+
+
+def distill_status(db_path: Path, version: str | None, get_config) -> dict[str, Any]:
+    """Per-kind distillation progress for the UI (counts + % complete).
+
+    ``eligible`` is the number of source records the distiller actually targets
+    (after relevance filtering, e.g. only purchasable items). ``done`` counts
+    rows distilled at the current schema version; ``pending`` is the eligible
+    remainder. Cheap to call: it only loads source JSON for not-yet-distilled
+    rows.
+    """
+    cfg = get_config()
+    status: dict[str, Any] = {
+        "version": version,
+        "enabled": bool(cfg.get("distiller_enabled", True)),
+        "model": cfg.get("distiller_model") or "claude-haiku-4-5",
+        "has_api_key": bool(cfg.get("anthropic_api_key")),
+        "running": _distill_lock.locked(),
+        "schema_version": DISTILL_SCHEMA_VERSION,
+        "kinds": {},
+        "done": 0,
+        "eligible": 0,
+        "pct": 0.0,
+    }
+    if not version:
+        return status
+
+    done_counts = db.facts_counts(db_path, version, DISTILL_SCHEMA_VERSION)
+    total_done = 0
+    total_eligible = 0
+    for kind, table in _KIND_TO_TABLE.items():
+        done = done_counts.get(table, 0)
+        prepare = _PREPARE[kind]
+        pending_rows = db.pending_facts(db_path, table, version, DISTILL_SCHEMA_VERSION)
+        pending = sum(1 for rec in pending_rows if prepare(rec) is not None)
+        eligible = done + pending
+        pct = round(100.0 * done / eligible, 1) if eligible else 100.0
+        status["kinds"][kind] = {
+            "label": _KIND_LABEL[kind],
+            "done": done,
+            "pending": pending,
+            "eligible": eligible,
+            "pct": pct,
+        }
+        total_done += done
+        total_eligible += eligible
+
+    status["done"] = total_done
+    status["eligible"] = total_eligible
+    status["pct"] = round(100.0 * total_done / total_eligible, 1) if total_eligible else 100.0
+    status["complete"] = total_eligible > 0 and total_done >= total_eligible
+    return status
 
 
 def _main(argv: list[str] | None = None) -> int:

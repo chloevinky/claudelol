@@ -173,7 +173,12 @@
       const tabId = `tab-${btn.dataset.tab}`;
       const panel = document.getElementById(tabId);
       if (panel) panel.classList.add("active");
-      if (btn.dataset.tab === "config") loadConfig();
+      if (btn.dataset.tab === "config") {
+        loadConfig();
+      } else if (distillPoll) {
+        clearInterval(distillPoll);
+        distillPoll = null;
+      }
     });
   });
 
@@ -201,6 +206,75 @@
     }
 
     loadLogs();
+    loadDistill();
+  }
+
+  function progressBar(pct) {
+    const clamped = Math.max(0, Math.min(100, pct || 0));
+    let cls = "fill";
+    if (clamped >= 100) cls += " done";
+    else if (clamped < 100) cls += " partial";
+    return `<div class="progress"><div class="${cls}" style="width:${clamped}%"></div></div>`;
+  }
+
+  function renderDistill(d) {
+    const summary = $("#distill-summary");
+    const overall = $("#distill-overall");
+    const kinds = $("#distill-kinds");
+    if (!summary || !overall || !kinds) return;
+
+    if (!d || !d.version) {
+      summary.textContent = "No patch cached yet — download the patch first.";
+      overall.innerHTML = "";
+      kinds.innerHTML = "";
+      return;
+    }
+
+    const bits = [`Model: ${d.model}`];
+    bits.push(d.enabled ? "enabled" : "disabled");
+    if (!d.has_api_key) bits.push("no API key");
+    if (d.running) bits.push("running…");
+    else if (d.complete) bits.push("complete");
+    summary.textContent = bits.join(" · ");
+
+    overall.innerHTML = `
+      <div class="progress-label"><span>Overall</span><span>${d.done} / ${d.eligible} (${d.pct}%)</span></div>
+      ${progressBar(d.pct)}
+    `;
+
+    const order = ["item", "champion", "rune", "spell"];
+    kinds.innerHTML = "";
+    order.forEach((k) => {
+      const row = d.kinds && d.kinds[k];
+      if (!row) return;
+      const div = document.createElement("div");
+      div.className = "progress-row";
+      div.innerHTML = `
+        <div class="progress-label"><span>${row.label}</span><span>${row.done} / ${row.eligible} (${row.pct}%)</span></div>
+        ${progressBar(row.pct)}
+      `;
+      kinds.appendChild(div);
+    });
+  }
+
+  let distillPoll = null;
+
+  async function loadDistill() {
+    try {
+      const r = await fetch("/api/distill");
+      const d = await r.json();
+      renderDistill(d);
+      // Auto-poll while a run is in progress; stop once it settles.
+      const onConfigTab = document.getElementById("tab-config")?.classList.contains("active");
+      if (d.running && onConfigTab && !distillPoll) {
+        distillPoll = setInterval(loadDistill, 2500);
+      } else if (!d.running && distillPoll) {
+        clearInterval(distillPoll);
+        distillPoll = null;
+      }
+    } catch (e) {
+      // ignore
+    }
   }
 
   function fmtBytes(n) {
@@ -279,6 +353,22 @@
       return;
     }
     loadConfig();
+  });
+
+  $("#refresh-distill").addEventListener("click", async () => {
+    const summary = $("#distill-summary");
+    try {
+      const r = await fetch("/api/distill/run", { method: "POST" });
+      if (!r.ok) {
+        const body = await r.json().catch(() => ({}));
+        if (summary) summary.textContent = body.detail || `Failed: ${r.status}`;
+        return;
+      }
+    } catch (e) {
+      if (summary) summary.textContent = `Failed: ${e.message}`;
+      return;
+    }
+    loadDistill();
   });
 
   $("#refresh-advice").addEventListener("click", async () => {
