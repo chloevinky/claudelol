@@ -21,6 +21,7 @@ from typing import Any
 
 import anthropic
 
+from . import config, db
 from .logging_setup import CLAUDE_TRACE
 
 log = logging.getLogger(__name__)
@@ -119,9 +120,9 @@ USE web_search when:
 - Looking up matchup-specific item priorities (e.g. "Aatrox vs Darius items")
 
 HARD RULES — do NOT break these:
-- NEVER describe how a specific enemy ability works. You have not been told \
-the current patch's ability text and you must not invent it. If you don't \
-know, do not write it down.
+- NEVER describe how a specific enemy ability works. Reason ONLY from the \
+stat-level traits you are given (plus web_search for builds); never invent \
+ability mechanics or numbers. If you don't know, do not write it down.
 - NEVER give "bait this ability" or "dodge that ability" style tactical tips.
 - NEVER reference an enemy ability by name in `tips`, `reason`, or `against`. \
 Refer to traits ("healing", "heavy AD", etc.) instead.
@@ -180,6 +181,160 @@ def _write_trace(record: dict[str, Any]) -> None:
             f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
     except Exception:
         log.exception("Failed to write Claude trace")
+
+
+# --- Distilled Data Dragon reference -----------------------------------------
+#
+# When the distiller has populated facts for the current patch, we ground the
+# advisor with exact item numbers + counter tags and champion threat profiles.
+# Everything here degrades gracefully: any miss returns None and the advisor
+# behaves exactly as it did before (web_search only).
+
+
+def _fmt_item(f: dict[str, Any]) -> str:
+    parts = [f.get("name", "?")]
+    if f.get("gold") is not None:
+        parts.append(f"{f['gold']}g")
+    stats = f.get("stats") or {}
+    stat_str = " ".join(f"{k}={v}" for k, v in stats.items() if v)
+    if stat_str:
+        parts.append(stat_str)
+    effects = [
+        (e.get("notes") or e.get("name") or "").strip()
+        for e in (f.get("effects") or [])
+    ]
+    effects = [e for e in effects if e]
+    if effects:
+        parts.append("fx[" + "; ".join(effects) + "]")
+    if f.get("counters"):
+        parts.append("counters:" + ",".join(f["counters"]))
+    if f.get("grants"):
+        parts.append("grants:" + ",".join(f["grants"]))
+    return " | ".join(parts)
+
+
+def _fmt_champion(f: dict[str, Any]) -> str:
+    head = f.get("name", "?")
+    tags = f.get("tags") or []
+    if tags:
+        head += f" ({','.join(tags)})"
+    parts = [head]
+    dmg = f.get("damage") or {}
+    dpieces = [
+        f"{lbl}{dmg[k]}"
+        for k, lbl in (("ad_pct", "ad"), ("ap_pct", "ap"), ("true_pct", "true"))
+        if dmg.get(k)
+    ]
+    if dpieces:
+        parts.append("dmg " + "/".join(dpieces))
+    if f.get("traits"):
+        parts.append("traits:" + ",".join(f["traits"]))
+    if f.get("cc"):
+        parts.append("cc:" + ",".join(f["cc"]))
+    if f.get("mobility"):
+        parts.append("mob:" + f["mobility"])
+    if f.get("range"):
+        parts.append(f["range"])
+    if f.get("sustain"):
+        parts.append("sustain")
+    if f.get("notes"):
+        parts.append(f"({f['notes']})")
+    return " | ".join(parts)
+
+
+def _fmt_trait(f: dict[str, Any]) -> str:
+    out = f.get("name", "?")
+    if f.get("traits"):
+        out += ": " + ",".join(f["traits"])
+    if f.get("notes"):
+        out += f" — {f['notes']}"
+    return out
+
+
+def _collect_unique(values) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for v in values:
+        if v and v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
+
+
+def build_reference(
+    snapshot: dict[str, Any], patch_version: str | None, cfg: dict[str, Any]
+) -> dict[str, str] | None:
+    """Build cached item-catalog + per-game champion/rune/spell reference text.
+
+    Returns ``{"item_block", "game_block", "version"}`` or ``None`` when
+    Data Dragon facts are unavailable (so the advisor falls back to today's
+    web_search-only behavior).
+    """
+    if not cfg.get("advisor_use_datadragon", True):
+        return None
+    try:
+        version = patch_version or db.patch_summary(config.DB_PATH).get("version")
+        if not version:
+            return None
+        catalog = db.item_facts_catalog(config.DB_PATH, version)
+        if not catalog:
+            return None
+
+        me = snapshot.get("me") or {}
+        allies = snapshot.get("allies") or []
+        enemies = snapshot.get("enemies") or []
+
+        champ_names = _collect_unique(
+            [me.get("champion")]
+            + [p.get("champion") for p in allies]
+            + [p.get("champion") for p in enemies]
+        )
+        champs = [
+            f for n in champ_names if (f := db.champion_facts(config.DB_PATH, version, n))
+        ]
+
+        full_runes = me.get("full_runes") or {}
+        rune_names = _collect_unique(
+            [me.get("keystone"), full_runes.get("keystone")]
+            + list(full_runes.get("primary_runes") or [])
+            + [p.get("keystone") for p in enemies]
+        )
+        runes = [
+            f for n in rune_names if (f := db.rune_facts(config.DB_PATH, version, n))
+        ]
+
+        spell_names = _collect_unique(
+            [s for p in [me, *enemies] for s in (p.get("summoner_spells") or [])]
+        )
+        spells = [
+            f for n in spell_names if (f := db.spell_facts(config.DB_PATH, version, n))
+        ]
+
+        item_block = (
+            f"ITEM REFERENCE (patch {version}) — exact stats, parsed effects, and the "
+            "enemy traits each item COUNTERS. Recommend ONLY items in this list; match "
+            "the `counters` tags to the enemy team's traits below.\n"
+            + "\n".join(_fmt_item(f) for f in catalog)
+        )
+
+        game_lines: list[str] = [
+            f"DISTILLED REFERENCE (patch {version}) — use ONLY these grounded "
+            "stats/traits; do not invent anything beyond them."
+        ]
+        if champs:
+            game_lines.append("\nCHAMPIONS IN THIS GAME:")
+            game_lines += [_fmt_champion(f) for f in champs]
+        if runes:
+            game_lines.append("\nRUNES (yours + enemy keystones):")
+            game_lines += [_fmt_trait(f) for f in runes]
+        if spells:
+            game_lines.append("\nSUMMONER SPELLS (yours + enemies'):")
+            game_lines += [_fmt_trait(f) for f in spells]
+
+        return {"version": version, "item_block": item_block, "game_block": "\n".join(game_lines)}
+    except Exception:
+        log.exception("Advisor: failed to build Data Dragon reference; using fallback")
+        return None
 
 
 class ClaudeAdvisor:
@@ -292,10 +447,28 @@ class ClaudeAdvisor:
             + "\n```"
         )
 
+        # Ground the request in distilled Data Dragon facts when available. The
+        # per-patch item catalog goes in a cached system block (stable across
+        # games); the game-specific champion/rune/spell facts go in the user
+        # message. Missing facts -> reference is None -> identical to before.
+        reference = build_reference(snapshot, patch_version, cfg)
+        if reference:
+            user_message = user_message + "\n\n" + reference["game_block"]
+            system_param: Any = [
+                {"type": "text", "text": SYSTEM_PROMPT},
+                {
+                    "type": "text",
+                    "text": reference["item_block"],
+                    "cache_control": {"type": "ephemeral"},
+                },
+            ]
+        else:
+            system_param = SYSTEM_PROMPT
+
         kwargs: dict[str, Any] = dict(
             model=model,
             max_tokens=4096,
-            system=SYSTEM_PROMPT,
+            system=system_param,
             messages=[{"role": "user", "content": user_message}],
             tools=[
                 {"type": "web_search_20260209", "name": "web_search", "max_uses": max_uses},
@@ -365,7 +538,7 @@ class ClaudeAdvisor:
                 "patch": patch_version,
                 "model": model,
                 "request": {
-                    "system": SYSTEM_PROMPT,
+                    "system": system_param,
                     "user_message": user_message,
                     "tools": kwargs["tools"],
                     "max_tokens": kwargs["max_tokens"],

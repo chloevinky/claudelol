@@ -11,7 +11,7 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import config, data_dragon, db, logging_setup
+from . import config, data_dragon, db, distiller, logging_setup
 from .claude_advisor import ClaudeAdvisor
 from .game_monitor import GameMonitor
 
@@ -83,6 +83,7 @@ async def lifespan(app: FastAPI):
         db_path=config.DB_PATH,
         locale=cfg.get("ddragon_locale", "en_US"),
         interval_seconds=cfg.get("patch_check_interval_hours", 6) * 3600,
+        get_config=config.load,
     )
     advisor = ClaudeAdvisor(get_config=config.load)
     hub = WSHub()
@@ -110,6 +111,16 @@ async def lifespan(app: FastAPI):
 
     patch_watcher.start()
     monitor.start()
+
+    # Distill the already-cached patch right away so the advisor has grounded
+    # facts even before the watcher's first network check completes.
+    cached_version = db.patch_summary(config.DB_PATH).get("version")
+    if cached_version:
+        startup_distill = asyncio.create_task(
+            distiller.distill_patch(config.DB_PATH, cached_version, config.load),
+            name=f"distill-startup-{cached_version}",
+        )
+        startup_distill.add_done_callback(_log_task_exception)
 
     app.state.config = config
     app.state.monitor = monitor
@@ -183,7 +194,8 @@ def create_app() -> FastAPI:
     async def refresh_patch() -> dict[str, Any]:
         cfg = config.load()
         return await data_dragon.ensure_current_patch(
-            config.DB_PATH, cfg.get("ddragon_locale", "en_US"), force=True
+            config.DB_PATH, cfg.get("ddragon_locale", "en_US"), force=True,
+            get_config=config.load,
         )
 
     @app.post("/api/advice/refresh")
