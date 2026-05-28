@@ -68,6 +68,46 @@ CREATE TABLE IF NOT EXISTS summoner_spells (
     PRIMARY KEY (version, id)
 );
 CREATE INDEX IF NOT EXISTS idx_spells_key ON summoner_spells(version, key);
+
+-- Distilled "facts": compact, numbers-first objects produced by the cheap
+-- model from the raw Data Dragon JSON above. One row per source record.
+CREATE TABLE IF NOT EXISTS item_facts (
+    version TEXT NOT NULL,
+    id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    finished INTEGER,            -- 1 if a finished/buyable item, else 0
+    schema_version INTEGER NOT NULL,
+    facts TEXT NOT NULL,         -- distilled JSON
+    PRIMARY KEY (version, id)
+);
+
+CREATE TABLE IF NOT EXISTS champion_facts (
+    version TEXT NOT NULL,
+    id TEXT NOT NULL,            -- e.g. "Aatrox"
+    name TEXT NOT NULL,
+    schema_version INTEGER NOT NULL,
+    facts TEXT NOT NULL,
+    PRIMARY KEY (version, id)
+);
+CREATE INDEX IF NOT EXISTS idx_champion_facts_name ON champion_facts(version, name);
+
+CREATE TABLE IF NOT EXISTS rune_facts (
+    version TEXT NOT NULL,
+    id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    schema_version INTEGER NOT NULL,
+    facts TEXT NOT NULL,
+    PRIMARY KEY (version, id)
+);
+
+CREATE TABLE IF NOT EXISTS spell_facts (
+    version TEXT NOT NULL,
+    id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    schema_version INTEGER NOT NULL,
+    facts TEXT NOT NULL,
+    PRIMARY KEY (version, id)
+);
 """
 
 
@@ -271,3 +311,149 @@ def patch_summary(db_path: Path) -> dict[str, Any]:
         "locale": row["locale"],
         "counts": counts,
     }
+
+
+# --- Distilled facts -------------------------------------------------------
+#
+# Each facts table is populated by the cheap-model distiller. The mapping below
+# is the single source of truth for which raw table feeds which facts table; it
+# also gates the table name used in f-string SQL (so interpolation is safe).
+
+FACTS_SOURCES: dict[str, str] = {
+    "item_facts": "items",
+    "champion_facts": "champions",
+    "rune_facts": "runes",
+    "spell_facts": "summoner_spells",
+}
+
+
+def upsert_facts(db_path: Path, table: str, version: str, rows: Iterable[dict[str, Any]]) -> int:
+    """Batch-write distilled fact rows. Returns the number written.
+
+    Each row is a dict with keys ``id``, ``name``, ``schema_version`` and
+    ``facts`` (a dict or pre-serialized JSON string). ``item_facts`` rows may
+    also carry a ``finished`` flag.
+    """
+    if table not in FACTS_SOURCES:
+        raise ValueError(f"unknown facts table {table!r}")
+    has_finished = table == "item_facts"
+    payload: list[tuple] = []
+    for r in rows:
+        facts = r["facts"]
+        if not isinstance(facts, str):
+            facts = json.dumps(facts)
+        if has_finished:
+            payload.append(
+                (
+                    version,
+                    str(r["id"]),
+                    r.get("name", ""),
+                    1 if r.get("finished") else 0,
+                    int(r["schema_version"]),
+                    facts,
+                )
+            )
+        else:
+            payload.append(
+                (version, str(r["id"]), r.get("name", ""), int(r["schema_version"]), facts)
+            )
+    if not payload:
+        return 0
+    with connect(db_path) as conn:
+        if has_finished:
+            conn.executemany(
+                f"""INSERT OR REPLACE INTO {table}
+                   (version, id, name, finished, schema_version, facts)
+                   VALUES (?,?,?,?,?,?)""",
+                payload,
+            )
+        else:
+            conn.executemany(
+                f"""INSERT OR REPLACE INTO {table}
+                   (version, id, name, schema_version, facts)
+                   VALUES (?,?,?,?,?)""",
+                payload,
+            )
+        conn.commit()
+    return len(payload)
+
+
+def pending_facts(
+    db_path: Path, table: str, version: str, schema_version: int
+) -> list[dict[str, Any]]:
+    """Source records that have no up-to-date facts row (drives resumable distill).
+
+    A record is pending when it has no facts row for this version, or its stored
+    ``schema_version`` differs from the current one. Returns ``{id, name, data}``
+    with ``data`` parsed from the raw Data Dragon JSON.
+    """
+    if table not in FACTS_SOURCES:
+        raise ValueError(f"unknown facts table {table!r}")
+    source = FACTS_SOURCES[table]
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            f"""
+            SELECT s.id AS id, s.name AS name, s.data AS data
+            FROM {source} s
+            LEFT JOIN {table} f
+              ON f.version = s.version AND f.id = s.id AND f.schema_version = ?
+            WHERE s.version = ? AND f.id IS NULL
+            """,
+            (schema_version, version),
+        ).fetchall()
+    return [{"id": r["id"], "name": r["name"], "data": json.loads(r["data"])} for r in rows]
+
+
+def facts_counts(db_path: Path, version: str) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    with connect(db_path) as conn:
+        for table in FACTS_SOURCES:
+            c = conn.execute(
+                f"SELECT COUNT(*) AS n FROM {table} WHERE version=?", (version,)
+            ).fetchone()
+            counts[table] = c["n"]
+    return counts
+
+
+def item_facts_catalog(
+    db_path: Path, version: str, finished_only: bool = False
+) -> list[dict[str, Any]]:
+    """Compact list of distilled item facts for injection into the advisor."""
+    sql = "SELECT id, name, finished, facts FROM item_facts WHERE version=?"
+    params: list[Any] = [version]
+    if finished_only:
+        sql += " AND finished=1"
+    sql += " ORDER BY name"
+    with connect(db_path) as conn:
+        rows = conn.execute(sql, params).fetchall()
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        facts = json.loads(r["facts"])
+        facts.setdefault("id", r["id"])
+        facts.setdefault("name", r["name"])
+        facts["finished"] = bool(r["finished"])
+        out.append(facts)
+    return out
+
+
+def _facts_by_name(
+    db_path: Path, table: str, version: str, name: str
+) -> dict[str, Any] | None:
+    with connect(db_path) as conn:
+        row = conn.execute(
+            f"SELECT facts FROM {table} WHERE version=? AND (name=? OR id=?) LIMIT 1",
+            (version, name, name),
+        ).fetchone()
+    return json.loads(row["facts"]) if row else None
+
+
+def champion_facts(db_path: Path, version: str, name: str) -> dict[str, Any] | None:
+    return _facts_by_name(db_path, "champion_facts", version, name)
+
+
+def rune_facts(db_path: Path, version: str, name: str) -> dict[str, Any] | None:
+    return _facts_by_name(db_path, "rune_facts", version, name)
+
+
+def spell_facts(db_path: Path, version: str, name: str) -> dict[str, Any] | None:
+    return _facts_by_name(db_path, "spell_facts", version, name)

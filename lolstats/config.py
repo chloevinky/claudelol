@@ -21,6 +21,11 @@ _DEFAULTS: dict[str, Any] = {
     "ddragon_locale": "en_US",
     "live_client_host": "https://127.0.0.1:2999",
     "advisor_cooldown_seconds": 30,
+    "distiller_model": "claude-haiku-4-5",
+    "distiller_enabled": True,
+    "distill_batch_size": 15,
+    "distill_max_concurrency": 4,
+    "advisor_use_datadragon": True,
 }
 
 _lock = threading.Lock()

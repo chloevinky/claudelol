@@ -9,9 +9,17 @@ from typing import Any
 
 import httpx
 
-from . import db
+from . import db, distiller
 
 log = logging.getLogger(__name__)
+
+
+def _log_task_exception(task: asyncio.Task) -> None:
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        log.exception("Distillation task failed", exc_info=exc)
 
 DDRAGON_BASE = "https://ddragon.leagueoflegends.com"
 VERSIONS_URL = f"{DDRAGON_BASE}/api/versions.json"
@@ -83,23 +91,34 @@ async def fetch_patch(db_path: Path, version: str, locale: str = "en_US") -> dic
 
 
 async def ensure_current_patch(
-    db_path: Path, locale: str, force: bool = False
+    db_path: Path, locale: str, force: bool = False, get_config=None
 ) -> dict[str, Any]:
     version = await latest_version()
     if not force and db.have_version(db_path, version):
         log.info("Data Dragon: already have %s", version)
-        return {"version": version, "skipped": True, **db.patch_summary(db_path)}
-    log.info("Data Dragon: fetching patch %s (%s)", version, locale)
-    return await fetch_patch(db_path, version, locale=locale)
+        summary = {"version": version, "skipped": True, **db.patch_summary(db_path)}
+    else:
+        log.info("Data Dragon: fetching patch %s (%s)", version, locale)
+        summary = await fetch_patch(db_path, version, locale=locale)
+    # Eagerly (re)distill in the background. It only fills gaps, so an interrupted
+    # prior run resumes here even when the patch itself was already cached.
+    if get_config is not None:
+        task = asyncio.create_task(
+            distiller.distill_patch(db_path, version, get_config),
+            name=f"distill-{version}",
+        )
+        task.add_done_callback(_log_task_exception)
+    return summary
 
 
 class PatchWatcher:
     """Background task that periodically checks for a new patch."""
 
-    def __init__(self, db_path: Path, locale: str, interval_seconds: float):
+    def __init__(self, db_path: Path, locale: str, interval_seconds: float, get_config=None):
         self.db_path = db_path
         self.locale = locale
         self.interval = max(60.0, interval_seconds)
+        self.get_config = get_config
         self._task: asyncio.Task | None = None
         self.last_check: float = 0.0
         self.last_version: str | None = None
@@ -108,7 +127,9 @@ class PatchWatcher:
         failures = 0
         while True:
             try:
-                summary = await ensure_current_patch(self.db_path, self.locale)
+                summary = await ensure_current_patch(
+                    self.db_path, self.locale, get_config=self.get_config
+                )
                 self.last_version = summary.get("version")
                 self.last_check = time.time()
                 failures = 0
