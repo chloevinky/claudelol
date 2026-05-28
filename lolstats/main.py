@@ -198,6 +198,42 @@ def create_app() -> FastAPI:
             get_config=config.load,
         )
 
+    @app.get("/api/champions")
+    async def list_champions() -> dict[str, Any]:
+        version = db.patch_summary(config.DB_PATH).get("version")
+        if not version:
+            return {"version": None, "champions": []}
+        return {
+            "version": version,
+            "champions": db.all_champion_names(config.DB_PATH, version),
+        }
+
+    @app.post("/api/pregame")
+    async def pregame_advice(payload: dict[str, Any]) -> dict[str, Any]:
+        champion = (payload.get("champion") or "").strip()
+        role = (payload.get("role") or "").strip()
+        topic = (payload.get("topic") or "runes").strip()
+        if not champion:
+            raise HTTPException(status_code=400, detail="A champion is required.")
+        from .claude_advisor import PREGAME_TOPICS
+        if topic not in PREGAME_TOPICS:
+            raise HTTPException(status_code=400, detail=f"Unknown topic {topic!r}.")
+        cfg = config.load()
+        if not cfg.get("anthropic_api_key"):
+            raise HTTPException(status_code=400, detail="Anthropic API key not configured.")
+        version = app.state.patch_watcher.last_version or db.patch_summary(config.DB_PATH).get("version")
+        resp = await app.state.advisor.get_pregame_advice(topic, champion, role, version)
+        return {
+            "topic": topic,
+            "champion": champion,
+            "role": role,
+            "patch_version": resp.patch_version,
+            "advice": resp.advice,
+            "cached": resp.cached,
+            "error": resp.error,
+            "model": resp.model,
+        }
+
     @app.get("/api/distill")
     async def get_distill() -> dict[str, Any]:
         version = db.patch_summary(config.DB_PATH).get("version")

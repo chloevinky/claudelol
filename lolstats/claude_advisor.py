@@ -143,6 +143,121 @@ FORMAT:
 - best_items must be the standard current-patch core build for the user's champion."""
 
 
+# --- Pre-game setup advice (runes / spells / starting items) -----------------
+#
+# Runes, summoner spells and starting items are all locked BEFORE the match
+# starts, so the live in-game flow can't help with them. This is a standalone
+# Q&A: the user picks a champion + role + topic from dropdowns and we return a
+# standard current-patch setup. Answers are cached per (topic, champ, role,
+# patch) so re-asking never spends tokens.
+
+PREGAME_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "summary": {
+            "type": "string",
+            "description": "One-line recommendation (under 90 chars).",
+        },
+        "groups": {
+            "type": "array",
+            "description": "Recommendation groups, in the order they're picked.",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "label": {
+                        "type": "string",
+                        "description": (
+                            "Group name, e.g. 'Keystone', 'Primary: Precision', "
+                            "'Secondary: Resolve', 'Stat Shards', 'Summoner Spells', "
+                            "'Starting Items'."
+                        ),
+                    },
+                    "picks": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Exact rune / spell / item names, in order.",
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Under 15 words, stat/role level — no ability mechanics.",
+                    },
+                },
+                "required": ["label", "picks"],
+                "additionalProperties": False,
+            },
+        },
+        "notes": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "0-3 short setup notes (matchup flex, when to swap). No ability mechanics.",
+        },
+    },
+    "required": ["summary", "groups"],
+    "additionalProperties": False,
+}
+
+PREGAME_TOPICS: dict[str, str] = {
+    "runes": (
+        "Recommend the standard current-patch RUNE PAGE. Provide groups in this "
+        "order: 'Keystone' (1 pick), 'Primary: <tree>' (the 3 minor runes), "
+        "'Secondary: <tree>' (2 runes), and 'Stat Shards' (the 3 shards: "
+        "offense / flex / defense). Name every rune, tree, and shard exactly."
+    ),
+    "summoner_spells": (
+        "Recommend the standard current-patch SUMMONER SPELLS as a single group "
+        "'Summoner Spells' with the 2 spells, plus any common alternative as a note."
+    ),
+    "starting_items": (
+        "Recommend the standard current-patch STARTING ITEMS as a group "
+        "'Starting Items' (items + consumables bought on first back-to-base 0)."
+    ),
+}
+
+PREGAME_SYSTEM = """You are a League of Legends PRE-GAME setup coach for the current patch. \
+The user is at champion select / loading screen and must lock in runes, summoner \
+spells, and starting items before the game begins.
+
+YOUR JOB: Give the standard, current-patch setup for the requested champion and \
+role. Prefer the most popular / highest-winrate option.
+
+USE web_search to confirm the current-patch meta build (op.gg, u.gg, mobalytics, \
+lolalytics). Always search — rune/spell metas shift between patches.
+
+HARD RULES:
+- Name runes, keystones, trees, shards, spells, and items EXACTLY as they appear \
+in-client this patch. Never invent names.
+- Keep every `reason` and note under ~15 words.
+- Do NOT describe how abilities work or give in-lane mechanical tips. Stay at the \
+setup / stat / role level.
+- If you are unsure something exists in the current patch, search rather than guess."""
+
+
+def _parse_json_blocks(response: Any) -> tuple[dict[str, Any], str]:
+    """Return ``(parsed_obj, raw_text)`` from the last JSON-bearing text block.
+
+    With web_search the model emits text before and after tool calls; the answer
+    is in the final block, so walk in reverse and parse the first valid JSON.
+    """
+    text = ""
+    text_blocks = [
+        b.text for b in response.content
+        if getattr(b, "type", None) == "text" and getattr(b, "text", "")
+    ]
+    for candidate in reversed(text_blocks):
+        text = candidate
+        try:
+            return json.loads(candidate), candidate
+        except json.JSONDecodeError:
+            start = candidate.find("{")
+            end = candidate.rfind("}")
+            if start != -1 and end > start:
+                try:
+                    return json.loads(candidate[start : end + 1]), candidate
+                except json.JSONDecodeError:
+                    continue
+    return {}, text
+
+
 @dataclass
 class AdvisorResponse:
     advice: dict[str, Any]
@@ -563,5 +678,122 @@ class ClaudeAdvisor:
             raw_text=text,
         )
 
+    # -- pre-game (runes / spells / starting items) --------------------------
+
+    async def get_pregame_advice(
+        self, topic: str, champion: str, role: str, patch_version: str | None
+    ) -> AdvisorResponse:
+        """Cached pre-game setup advice. Re-asking the same combo spends no tokens."""
+        cache_key = f"pregame:{topic}:{champion}:{role}:{patch_version}"
+        if cache_key in self._cache:
+            c = self._cache[cache_key]
+            return AdvisorResponse(
+                advice=c.advice, requested_at=c.requested_at, fingerprint=cache_key,
+                patch_version=c.patch_version, cached=True, model=c.model, raw_text=c.raw_text,
+            )
+
+        async with self._lock:
+            if cache_key in self._inflight:
+                return await self._inflight[cache_key]
+            future: asyncio.Future = asyncio.get_running_loop().create_future()
+            self._inflight[cache_key] = future
+
+        try:
+            resp = await self._do_pregame_request(topic, champion, role, patch_version, cache_key)
+            self._cache[cache_key] = resp
+            future.set_result(resp)
+            return resp
+        except Exception as exc:
+            log.exception("Pre-game advisor request failed")
+            err = AdvisorResponse(
+                advice={}, requested_at=time.time(), fingerprint=cache_key,
+                patch_version=patch_version, error=str(exc),
+            )
+            future.set_result(err)
+            return err
+        finally:
+            self._inflight.pop(cache_key, None)
+
+    async def _do_pregame_request(
+        self, topic: str, champion: str, role: str, patch_version: str | None, cache_key: str
+    ) -> AdvisorResponse:
+        cfg = self._get_config()
+        key = cfg.get("anthropic_api_key") or ""
+        if not key:
+            raise RuntimeError("No Anthropic API key configured")
+        client = self._client_for(key)
+
+        cooldown = float(cfg.get("advisor_cooldown_seconds", 30))
+        wait = self._last_request_at + cooldown - time.time()
+        if wait > 0:
+            await asyncio.sleep(wait)
+        self._last_request_at = time.time()
+
+        model = cfg.get("claude_model") or "claude-opus-4-7"
+        max_uses = int(cfg.get("web_search_max_uses", 3))
+        topic_instr = PREGAME_TOPICS.get(topic, PREGAME_TOPICS["runes"])
+        role_str = role or "their usual role"
+
+        # Ground the champion's identity in distilled facts when available.
+        version = patch_version or db.patch_summary(config.DB_PATH).get("version")
+        champ_block = ""
+        if cfg.get("advisor_use_datadragon", True) and version:
+            try:
+                cf = db.champion_facts(config.DB_PATH, version, champion)
+                if cf:
+                    champ_block = "\n\nGrounded champion profile (stat-level): " + _fmt_champion(cf)
+            except Exception:
+                log.exception("Pre-game: failed to load champion facts")
+
+        user_message = (
+            f"Champion: {champion}\nRole: {role_str}\nPatch: {version or 'current'}\n\n"
+            f"{topic_instr}\n\nReturn JSON matching the schema." + champ_block
+        )
+
+        kwargs: dict[str, Any] = dict(
+            model=model,
+            max_tokens=2048,
+            system=PREGAME_SYSTEM,
+            messages=[{"role": "user", "content": user_message}],
+            tools=[{"type": "web_search_20260209", "name": "web_search", "max_uses": max_uses}],
+            output_config={"format": {"type": "json_schema", "schema": PREGAME_SCHEMA}},
+        )
+
+        started = time.time()
+        log.info("Pre-game request: topic=%s champ=%s role=%s patch=%s model=%s",
+                 topic, champion, role, version, model)
+        response = await client.messages.create(**kwargs)
+        advice, text = _parse_json_blocks(response)
+        if not advice:
+            log.warning("Pre-game advisor: no valid JSON for %s %s", topic, champion)
+
+        usage = {}
+        try:
+            usage = response.usage.model_dump(mode="json")
+        except Exception:
+            pass
+        elapsed = time.time() - started
+        log.info("Pre-game response: champ=%s topic=%s stop=%s elapsed=%.1fs groups=%d",
+                 champion, topic, getattr(response, "stop_reason", None), elapsed,
+                 len(advice.get("groups", []) or []))
+
+        _write_trace({
+            "ts": time.time(), "elapsed_seconds": elapsed, "kind": "pregame",
+            "topic": topic, "champion": champion, "role": role, "patch": version,
+            "model": model,
+            "request": {"system": PREGAME_SYSTEM, "user_message": user_message,
+                        "tools": kwargs["tools"], "output_schema": PREGAME_SCHEMA},
+            "response": {"stop_reason": getattr(response, "stop_reason", None),
+                         "usage": usage, "content": [_dump_block(b) for b in response.content]},
+            "parsed_advice": advice, "raw_final_text": text,
+        })
+
+        return AdvisorResponse(
+            advice=advice, requested_at=time.time(), fingerprint=cache_key,
+            patch_version=version, model=model, raw_text=text,
+        )
+
     def clear_cache(self) -> None:
-        self._cache.clear()
+        # Drop only in-game matchup advice; keep cached pre-game answers so the
+        # "Re-query" button doesn't force a paid re-ask of runes/spells/items.
+        self._cache = {k: v for k, v in self._cache.items() if k.startswith("pregame:")}
