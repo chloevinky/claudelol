@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>LoL Live Coach</title>
-  <link rel="stylesheet" href="/static/style.css" />
+  <link rel="stylesheet" href="/static/style.css?v=3" />
 </head>
 <body>
   <header>
@@ -14,6 +14,7 @@
     </div>
     <nav>
       <button class="tab active" data-tab="game">Game</button>
+      <button class="tab" data-tab="pregame">Pre-game</button>
       <button class="tab" data-tab="config">Settings</button>
     </nav>
     <div class="meta">
@@ -75,6 +76,52 @@
           <h2>Allies</h2>
           <div id="allies" class="team"></div>
         </div>
+      </div>
+    </section>
+
+    <section id="tab-pregame" class="tab-panel">
+      <div class="card">
+        <h2>Pre-game setup advice</h2>
+        <p class="muted small">
+          Runes, summoner spells, and starting items are locked before the match
+          starts — ask here ahead of time. Answers are cached per patch, so asking
+          the same question again is free.
+        </p>
+        <form id="pregame-form" class="pregame-form">
+          <label>
+            <span>Question</span>
+            <select name="topic">
+              <option value="runes">What are the best runes for…</option>
+              <option value="summoner_spells">What are the best summoner spells for…</option>
+              <option value="starting_items">What are the best starting items for…</option>
+            </select>
+          </label>
+          <label>
+            <span>Champion</span>
+            <select name="champion" id="pregame-champion"><option value="">Loading…</option></select>
+          </label>
+          <label>
+            <span>Role</span>
+            <select name="role">
+              <option value="Top">Top</option>
+              <option value="Jungle">Jungle</option>
+              <option value="Mid">Mid</option>
+              <option value="Bot">Bot (ADC)</option>
+              <option value="Support">Support</option>
+            </select>
+          </label>
+          <button type="submit" class="btn primary" id="pregame-ask">Ask Claude</button>
+        </form>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <h2 id="pregame-title">Answer</h2>
+          <span id="pregame-meta" class="muted small"></span>
+        </div>
+        <div id="pregame-summary" class="big">Pick a champion and ask.</div>
+        <div id="pregame-groups" class="list"></div>
+        <ul id="pregame-notes" class="tips"></ul>
       </div>
     </section>
 
@@ -181,6 +228,6 @@
     </section>
   </main>
 
-  <script src="/static/app.js"></script>
+  <script src="/static/app.js?v=3"></script>
 </body>
 </html>

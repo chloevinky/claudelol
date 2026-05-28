@@ -179,6 +179,7 @@
         clearInterval(distillPoll);
         distillPoll = null;
       }
+      if (btn.dataset.tab === "pregame") loadChampions();
     });
   });
 
@@ -260,8 +261,13 @@
   let distillPoll = null;
 
   async function loadDistill() {
+    const summary = $("#distill-summary");
     try {
       const r = await fetch("/api/distill");
+      if (!r.ok) {
+        if (summary) summary.textContent = `Couldn't load status (HTTP ${r.status}).`;
+        return;
+      }
       const d = await r.json();
       renderDistill(d);
       // Auto-poll while a run is in progress; stop once it settles.
@@ -313,8 +319,110 @@
         tailEl.textContent = (td.lines || []).join("\n");
       }
     } catch (e) {
-      // ignore
+      if (summary) summary.textContent = "Couldn't load distillation status.";
     }
+  }
+
+  // -- pre-game (runes / spells / starting items) --
+
+  let championsLoaded = false;
+
+  async function loadChampions() {
+    if (championsLoaded) return;
+    const sel = $("#pregame-champion");
+    if (!sel) return;
+    try {
+      const r = await fetch("/api/champions");
+      const data = await r.json();
+      const names = data.champions || [];
+      if (!names.length) {
+        sel.innerHTML = `<option value="">No champions cached yet</option>`;
+        return;
+      }
+      sel.innerHTML = names.map((n) => `<option value="${n}">${n}</option>`).join("");
+      championsLoaded = true;
+    } catch (e) {
+      sel.innerHTML = `<option value="">Failed to load champions</option>`;
+    }
+  }
+
+  function renderPregame(data) {
+    const title = $("#pregame-title");
+    const meta = $("#pregame-meta");
+    const summary = $("#pregame-summary");
+    const groups = $("#pregame-groups");
+    const notes = $("#pregame-notes");
+    const advice = data && data.advice;
+    if (!advice || !Object.keys(advice).length) {
+      summary.textContent = data && data.error ? `Error: ${data.error}` : "No answer returned.";
+      groups.innerHTML = "";
+      notes.innerHTML = "";
+      meta.textContent = "";
+      return;
+    }
+    const topicLabel = { runes: "Runes", summoner_spells: "Summoner spells", starting_items: "Starting items" }[data.topic] || "Setup";
+    title.textContent = `${topicLabel}: ${data.champion}${data.role ? " · " + data.role : ""}`;
+    summary.textContent = advice.summary || "—";
+
+    groups.innerHTML = "";
+    (advice.groups || []).forEach((g) => {
+      const div = document.createElement("div");
+      div.className = "li-block";
+      const picks = (g.picks || []).join(" · ");
+      div.innerHTML = `<span class="name">${g.label || ""}</span>` +
+        `<span class="picks">${picks}</span>` +
+        (g.reason ? `<span class="reason">${g.reason}</span>` : "");
+      groups.appendChild(div);
+    });
+    if (!groups.children.length) groups.innerHTML = `<div class="muted small">—</div>`;
+
+    notes.innerHTML = "";
+    (advice.notes || []).forEach((n) => {
+      const li = document.createElement("li");
+      li.textContent = n;
+      notes.appendChild(li);
+    });
+
+    const cachedStr = data.cached ? "cached" : "fresh";
+    meta.textContent = `${data.model || ""} · patch ${data.patch_version || "?"} · ${cachedStr}`;
+  }
+
+  const pregameForm = $("#pregame-form");
+  if (pregameForm) {
+    pregameForm.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const champion = pregameForm.elements["champion"].value;
+      const role = pregameForm.elements["role"].value;
+      const topic = pregameForm.elements["topic"].value;
+      const summary = $("#pregame-summary");
+      const btn = $("#pregame-ask");
+      if (!champion) {
+        summary.textContent = "Pick a champion first.";
+        return;
+      }
+      $("#pregame-groups").innerHTML = "";
+      $("#pregame-notes").innerHTML = "";
+      $("#pregame-meta").textContent = "";
+      summary.textContent = "Asking Claude…";
+      btn.disabled = true;
+      try {
+        const r = await fetch("/api/pregame", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ champion, role, topic }),
+        });
+        const body = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          summary.textContent = body.detail || `Failed: ${r.status}`;
+          return;
+        }
+        renderPregame(body);
+      } catch (err) {
+        summary.textContent = `Failed: ${err.message}`;
+      } finally {
+        btn.disabled = false;
+      }
+    });
   }
 
   configForm.addEventListener("submit", async (e) => {

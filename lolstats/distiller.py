@@ -526,6 +526,18 @@ async def _process_batch(
     return db.upsert_facts(db_path, table, version, rows)
 
 
+def _collect_pending(db_path: Path, version: str, kind: str) -> list[dict[str, Any]]:
+    """Relevance-filtered records that still need distilling for ``kind``.
+
+    Irrelevant source rows (consumables, tree headers, ARAM-only spells, …) are
+    dropped here, so a fully-distilled catalog reports zero pending even though
+    those rows never get a facts row. This is what keeps re-runs free.
+    """
+    pending = db.pending_facts(db_path, _KIND_TO_TABLE[kind], version, DISTILL_SCHEMA_VERSION)
+    prepare = _PREPARE[kind]
+    return [p for rec in pending if (p := prepare(rec)) is not None]
+
+
 async def _distill_kind(
     db_path: Path,
     version: str,
@@ -534,17 +546,13 @@ async def _distill_kind(
     model: str,
     batch_size: int,
     sem: asyncio.Semaphore,
+    prepared: list[dict[str, Any]],
 ) -> int:
-    table = _KIND_TO_TABLE[kind]
-    pending = db.pending_facts(db_path, table, version, DISTILL_SCHEMA_VERSION)
-    prepare = _PREPARE[kind]
-    prepared = [p for rec in pending if (p := prepare(rec)) is not None]
     if not prepared:
         return 0
     batches = [prepared[i : i + batch_size] for i in range(0, len(prepared), batch_size)]
     log.info(
-        "Distiller: %s — %d pending (%d relevant) in %d batches",
-        kind, len(pending), len(prepared), len(batches),
+        "Distiller: %s — %d to distill in %d batches", kind, len(prepared), len(batches)
     )
     tasks = [
         _process_batch(db_path, version, kind, client, model, batch, sem)
@@ -572,12 +580,34 @@ async def distill_patch(db_path: Path, version: str, get_config) -> dict[str, An
 
     async with _distill_lock:
         _SCHEMA_DISABLED.clear()
+        # Compute the relevance-filtered work once, under the lock. When nothing
+        # is pending we return immediately WITHOUT opening an API client — a
+        # completed patch costs zero tokens to "re-distill", so the eager
+        # startup / patch-watcher / manual triggers are all safe to fire freely.
+        pending_by_kind = {
+            kind: _collect_pending(db_path, version, kind)
+            for kind in ("item", "champion", "rune", "spell")
+        }
+        total_pending = sum(len(v) for v in pending_by_kind.values())
+        if total_pending == 0:
+            log.info(
+                "Distiller: patch %s already fully distilled; nothing to do "
+                "(no API calls)", version,
+            )
+            return {
+                "version": version,
+                "model": model,
+                "skipped": "up_to_date",
+                "written": {k: 0 for k in pending_by_kind},
+                "facts_counts": db.facts_counts(db_path, version),
+            }
+
         sem = asyncio.Semaphore(concurrency)
         written: dict[str, int] = {}
         async with anthropic.AsyncAnthropic(api_key=key) as client:
-            for kind in ("item", "champion", "rune", "spell"):
+            for kind, prepared in pending_by_kind.items():
                 written[kind] = await _distill_kind(
-                    db_path, version, kind, client, model, batch_size, sem
+                    db_path, version, kind, client, model, batch_size, sem, prepared
                 )
         total = sum(written.values())
         if total:
@@ -620,9 +650,7 @@ def distill_status(db_path: Path, version: str | None, get_config) -> dict[str, 
     total_eligible = 0
     for kind, table in _KIND_TO_TABLE.items():
         done = done_counts.get(table, 0)
-        prepare = _PREPARE[kind]
-        pending_rows = db.pending_facts(db_path, table, version, DISTILL_SCHEMA_VERSION)
-        pending = sum(1 for rec in pending_rows if prepare(rec) is not None)
+        pending = len(_collect_pending(db_path, version, kind))
         eligible = done + pending
         pct = round(100.0 * done / eligible, 1) if eligible else 100.0
         status["kinds"][kind] = {

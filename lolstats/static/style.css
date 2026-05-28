@@ -199,6 +199,36 @@ fieldset.subsection legend {
   padding: 0 6px;
 }
 
+.pregame-form {
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  max-width: none;
+  gap: 12px;
+}
+.pregame-form label { flex: 1 1 180px; }
+.pregame-form button { flex: 0 0 auto; }
+
+#pregame-groups { margin-top: 10px; }
+.li-block {
+  display: flex;
+  flex-direction: column;
+  background: var(--panel-2);
+  border-radius: 6px;
+  padding: 8px 10px;
+  border-left: 3px solid var(--accent);
+}
+.li-block .name {
+  font-weight: 600;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--muted);
+}
+.li-block .picks { font-weight: 600; margin-top: 2px; }
+.li-block .reason { color: var(--muted); font-size: 12px; margin-top: 2px; }
+#pregame-notes { margin-top: 10px; }
+
 .progress-row { margin: 8px 0; }
 .progress-label {
   display: flex;
