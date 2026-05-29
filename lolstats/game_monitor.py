@@ -29,6 +29,9 @@ class GameMonitor:
             "fingerprint": None,
             "last_poll": 0.0,
             "last_game_start": None,
+            # Once a game's matchup is locked we emit exactly once and then go
+            # quiet until the game ends — no live mid-match re-queries / UI pushes.
+            "locked": False,
         }
 
     async def _emit(self) -> None:
@@ -62,6 +65,7 @@ class GameMonitor:
                         self.state["in_game"] = False
                         self.state["snapshot"] = None
                         self.state["fingerprint"] = None
+                        self.state["locked"] = False
                         await self._emit()
                 else:
                     snap = live_client.reduce_snapshot(raw)
@@ -77,22 +81,35 @@ class GameMonitor:
                         )
                         self.state["in_game"] = True
                         self.state["last_game_start"] = now
-                    if fp != self.state["fingerprint"]:
-                        me = (snap.get("me") or {})
-                        log.info(
-                            "State change: fp=%s gt=%ss champ=%s items=%d gold=%s lvl=%s",
-                            fp,
-                            (snap.get("game") or {}).get("game_time"),
-                            me.get("champion"),
-                            len(me.get("items", []) or []),
-                            me.get("current_gold"),
-                            me.get("level"),
-                        )
-                        self.state["snapshot"] = snap
-                        self.state["fingerprint"] = fp
-                        await self._emit()
+
+                    if self.state["locked"]:
+                        # Matchup already locked for this game: never re-emit, so
+                        # the advisor fires once and the UI stays put. (Position
+                        # data from the Live Client wobbles, which used to flip
+                        # the fingerprint and trigger spurious re-queries.)
+                        pass
                     else:
-                        self.state["snapshot"] = snap
+                        me = snap.get("me") or {}
+                        enemies = snap.get("enemies") or []
+                        if me.get("champion") and enemies:
+                            # First frame with a usable, fully-loaded matchup:
+                            # lock it, store snapshot/fingerprint, emit once.
+                            log.info(
+                                "Matchup locked: fp=%s gt=%ss champ=%s pos=%s enemies=%s "
+                                "— advisor fires once; no live updates until game end.",
+                                fp,
+                                (snap.get("game") or {}).get("game_time"),
+                                me.get("champion"), me.get("position"),
+                                [e.get("champion") for e in enemies],
+                            )
+                            self.state["snapshot"] = snap
+                            self.state["fingerprint"] = fp
+                            self.state["locked"] = True
+                            await self._emit()
+                        else:
+                            # Still loading (no champ or enemies yet) — keep the
+                            # latest snapshot but don't lock or emit yet.
+                            self.state["snapshot"] = snap
 
                 await asyncio.sleep(interval)
         finally:
