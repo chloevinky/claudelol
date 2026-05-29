@@ -169,6 +169,21 @@ async def _request_and_broadcast(
 def create_app() -> FastAPI:
     app = FastAPI(title="LoL Live Stats AI", lifespan=lifespan)
 
+    @app.middleware("http")
+    async def _revalidate_static(request, call_next):
+        """Serve the UI with must-revalidate so browsers never run stale assets.
+
+        ``no-cache`` keeps the file cached but forces a conditional request on
+        every load; StaticFiles answers with a cheap 304 when nothing changed,
+        or the fresh file the moment we ship a UI update — so there's no need to
+        version asset URLs by hand.
+        """
+        response = await call_next(request)
+        path = request.url.path
+        if path == "/" or path.startswith("/static"):
+            response.headers["Cache-Control"] = "no-cache, must-revalidate"
+        return response
+
     @app.get("/api/state")
     async def get_state() -> dict[str, Any]:
         return _state_payload(app.state.monitor, app.state.advisor)
